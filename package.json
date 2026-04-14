@@ -1,0 +1,25 @@
+{
+    "name": "dormancy-report",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "description": "Org dormancy report generator for GitHub activity and Copilot seats.",
+    "scripts": {
+        "start": "tsx src/dormancy-report.ts",
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "dependencies": {
+        "@octokit/plugin-retry": "^8.0.3",
+        "@octokit/request-error": "^7.1.0",
+        "@octokit/rest": "^22.0.0",
+        "commander": "^14.0.1",
+        "dotenv": "^17.2.3"
+    },
+    "devDependencies": {
+        "@types/node": "^24.7.2",
+        "tsx": "^4.20.6",
+        "typescript": "^5.9.3",
+        "vitest": "^3.2.4"
+    }
+}
