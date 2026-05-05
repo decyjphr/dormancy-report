@@ -4,17 +4,25 @@ import { pathToFileURL } from 'node:url'
 
 import { Command, Option } from 'commander'
 import dotenv from 'dotenv'
+import { createAppAuth } from '@octokit/auth-app'
 import { retry } from '@octokit/plugin-retry'
+import { throttling } from '@octokit/plugin-throttling'
 import { RequestError } from '@octokit/request-error'
 import { Octokit } from '@octokit/rest'
 
-if (!process.env.GITHUB_TOKEN) {
-  dotenv.config({ quiet: true })
-}
+dotenv.config({ quiet: true })
 
-const RetryingOctokit = Octokit.plugin(retry)
+const RetryingOctokit = Octokit.plugin(retry, throttling)
 
 export type ActivityMode = 'authored-only' | 'any-interaction'
+
+export type TokenType = 'pat' | 'app'
+
+type AppCredentials = {
+  appId: number
+  privateKey: string
+  installationId?: number
+}
 
 type CliOptions = {
   org?: string
@@ -26,6 +34,12 @@ type CliOptions = {
   concurrency: number
   enterprise?: string
   includeLoginActivity: boolean
+  // GitHub App auth
+  appId?: string
+  appPrivateKey?: string
+  appInstallationId?: string
+  // Legacy pre-generated token
+  githubAppToken?: string
 }
 
 type UserActivity = {
@@ -74,6 +88,7 @@ export function createCliProgram() {
   return new Command()
     .description('Generate an org dormancy report for commits, PRs, issues, and Copilot activity.')
     .option('--org <org>', 'Organization login')
+    .option('--github-app-token <token>', 'GitHub App token (instead of GITHUB_TOKEN)')
     .addOption(
       new Option('--days <days>', 'Dormancy window in days').default('30').argParser((value) => {
         const parsed = Number.parseInt(value, 10)
@@ -117,22 +132,12 @@ export function createCliProgram() {
       'Consider enterprise login events (action:user.login) as activity. Requires --enterprise.',
       false,
     )
+    .option('--app-id <id>', 'GitHub App ID (use with --app-private-key)')
+    .option('--app-private-key <key>', 'GitHub App private key PEM string or path to PEM file')
+    .option('--app-installation-id <id>', 'GitHub App installation ID (auto-detected if omitted)')
 }
 
 export async function runDormancyReport(options: CliOptions) {
-  if (!process.env.GITHUB_TOKEN) {
-    throw new Error('GITHUB_TOKEN environment variable not set')
-  }
-
-  const octokit = new RetryingOctokit({
-    auth: `token ${process.env.GITHUB_TOKEN}`,
-    retry: {
-      doNotRetry: ['429'],
-      enabled: true,
-      retries: 3,
-    },
-  })
-
   const cutoffDate = new Date()
   cutoffDate.setUTCDate(cutoffDate.getUTCDate() - options.days)
   const cutoffIso = cutoffDate.toISOString()
@@ -141,6 +146,10 @@ export async function runDormancyReport(options: CliOptions) {
   if (!options.org && !enterprise) {
     throw new Error('Provide --org, --enterprise, or GITHUB_ENTERPRISE')
   }
+
+  const appCreds = resolveAppCredentials(options)
+  const tokenType: TokenType = appCreds ? 'app' : 'pat'
+  const octokit = await createOctokit(appCreds, options, enterprise)
 
   const excluded = new Set(
     options.exclude
@@ -155,6 +164,7 @@ export async function runDormancyReport(options: CliOptions) {
   console.log(`Scope: ${runScope.scopeLabel}`)
   console.log(`Window: last ${options.days} days (cutoff: ${cutoffIso})`)
   console.log(`Mode: ${options.mode}`)
+  console.log(`Auth: ${tokenType}`)
 
   const members = runScope.members.filter(
     (login) => !excluded.has(login.toLowerCase()),
@@ -251,6 +261,156 @@ export async function runDormancyReport(options: CliOptions) {
   console.log(`Dormant users: ${dormant.length}/${all.length}`)
   console.log(`JSON report: ${jsonPath}`)
   console.log(`CSV report:  ${csvPath}`)
+}
+
+function resolveAppCredentials(options: CliOptions): AppCredentials | null {
+  const appId = options.appId ?? process.env.GITHUB_APP_ID
+  const rawKey = options.appPrivateKey ?? process.env.GITHUB_APP_PRIVATE_KEY
+  const installationIdStr = options.appInstallationId ?? process.env.GITHUB_APP_INSTALLATION_ID
+
+  if (!appId && !rawKey) return null
+
+  if (!appId || !rawKey) {
+    throw new Error('Both --app-id (GITHUB_APP_ID) and --app-private-key (GITHUB_APP_PRIVATE_KEY) are required for GitHub App auth')
+  }
+
+  const parsedId = Number.parseInt(appId, 10)
+  if (!Number.isFinite(parsedId) || parsedId <= 0) {
+    throw new Error('--app-id must be a positive integer')
+  }
+
+  const privateKey = decodePrivateKey(rawKey)
+
+  return {
+    appId: parsedId,
+    privateKey,
+    installationId: installationIdStr ? Number.parseInt(installationIdStr, 10) : undefined,
+  }
+}
+
+export function decodePrivateKey(raw: string): string {
+  // Already a PEM string (starts with dashes after optional whitespace)
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('-----')) {
+    // Still normalise escaped newlines that come from env vars like "...KEY...\nstuff"
+    return trimmed.replace(/\\n/g, '\n')
+  }
+
+  // Try base64 decode — covers both standard and URL-safe base64
+  try {
+    const decoded = Buffer.from(trimmed, 'base64').toString('utf8')
+    if (decoded.trim().startsWith('-----')) {
+      return decoded
+    }
+  } catch {
+    // fall through to error
+  }
+
+  throw new Error(
+    'GITHUB_APP_PRIVATE_KEY does not appear to be a valid PEM string or base64-encoded PEM',
+  )
+}
+
+function makeThrottleOptions() {
+  return {
+    onRateLimit(retryAfter: number, options: Record<string, unknown>, _octokit: unknown, retryCount: number) {
+      const method = options.method as string | undefined
+      const url = options.url as string | undefined
+      console.warn(
+        `Rate limit hit for ${method} ${url}. Retry after ${retryAfter}s (attempt ${retryCount + 1}).`,
+      )
+      // Retry up to 2 times before giving up
+      return retryCount < 2
+    },
+    onSecondaryRateLimit(retryAfter: number, options: Record<string, unknown>, _octokit: unknown, retryCount: number) {
+      const method = options.method as string | undefined
+      const url = options.url as string | undefined
+      console.warn(
+        `Secondary rate limit hit for ${method} ${url}. Retry after ${retryAfter}s (attempt ${retryCount + 1}).`,
+      )
+      // Always retry secondary rate limits — they resolve quickly
+      return retryCount < 3
+    },
+  }
+}
+
+async function createOctokit(
+  appCreds: AppCredentials | null,
+  options: CliOptions,
+  enterprise: string | undefined,
+): Promise<InstanceType<typeof RetryingOctokit>> {
+  const throttle = makeThrottleOptions()
+
+  if (!appCreds) {
+    const token = process.env.GITHUB_TOKEN ?? options.githubAppToken
+    if (!token) {
+      throw new Error('GITHUB_TOKEN environment variable not set')
+    }
+    return new RetryingOctokit({
+      auth: `token ${token}`,
+      retry: { enabled: true, retries: 5 },
+      throttle,
+    })
+  }
+
+  // Step 1: JWT-authenticated Octokit to look up the installation ID
+  const appOctokit = new RetryingOctokit({
+    authStrategy: createAppAuth,
+    auth: {
+      appId: appCreds.appId,
+      privateKey: appCreds.privateKey,
+    },
+    retry: { enabled: true, retries: 5 },
+    throttle,
+  })
+
+  const installationId = appCreds.installationId ?? await resolveInstallationId(appOctokit, options.org, enterprise)
+
+  // Step 2: installation-scoped Octokit with auto-refreshing token
+  return new RetryingOctokit({
+    authStrategy: createAppAuth,
+    auth: {
+      appId: appCreds.appId,
+      privateKey: appCreds.privateKey,
+      installationId,
+    },
+    retry: { enabled: true, retries: 5 },
+    throttle,
+  })
+}
+
+export async function resolveInstallationId(
+  appOctokit: InstanceType<typeof RetryingOctokit>,
+  org: string | undefined,
+  enterprise: string | undefined,
+): Promise<number> {
+  // Try enterprise-level installation first
+  if (enterprise) {
+    try {
+      const { data } = await appOctokit.rest.apps.getEnterpriseInstallation({ enterprise })
+      console.log(`GitHub App installation resolved for enterprise ${enterprise}: installation ${data.id}`)
+      return data.id
+    } catch {
+      // Fall through to org-level if enterprise endpoint is unavailable
+    }
+  }
+
+  if (org) {
+    const { data } = await appOctokit.rest.apps.getOrgInstallation({ org })
+    console.log(`GitHub App installation resolved for org ${org}: installation ${data.id}`)
+    return data.id
+  }
+
+  throw new Error(
+    'Cannot resolve GitHub App installation ID: provide --app-installation-id, --org, or --enterprise',
+  )
+}
+
+export function detectTokenType(token: string): TokenType {
+  if (token.startsWith('ghu_') || token.startsWith('ghs_')) {
+    return 'app'
+  }
+  return 'pat'
 }
 
 async function getOrgMembers(octokit: InstanceType<typeof RetryingOctokit>, org: string) {
