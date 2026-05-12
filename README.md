@@ -24,6 +24,9 @@ The script combines audit-log signals with targeted repository verification for 
 - Node.js 20+ recommended (Node 22+ preferred)
 - npm
 - GitHub token with org/repo read access and required Copilot visibility
+  - Personal access token (PAT): set `GITHUB_TOKEN`
+  - GitHub App token: set `GITHUB_APP_TOKEN` or use `--github-app-token`
+  - App tokens get 5,000 requests/hour; PATs get 60 requests/hour (if unauthenticated), or higher if authenticated
 
 ## Setup
 
@@ -63,8 +66,16 @@ Useful options:
 - `--exclude <comma,separated,logins>`
 - `--max-candidates <n>`
 - `--concurrency <n>`
+- `--github-app-token <token>`: GitHub App token (alternative to GITHUB_TOKEN)
 - `--include-login-activity` (enterprise audit-log login signal)
 - `--enterprise <enterprise>` (required when `--include-login-activity` is set)
+
+Rate limiting and retries:
+
+- Automatically detects rate limit state from GitHub API
+- Pauses requests if approaching limit (10% remaining)
+- Waits for reset before resuming
+- Retries failed requests up to 5 times with exponential backoff
 
 Behavior notes:
 

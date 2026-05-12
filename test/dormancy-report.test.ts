@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   csvCell,
+  decodePrivateKey,
+  detectTokenType,
   isEmptyRepositoryError,
   isEnterpriseLoginAction,
   isCommitAction,
   isIssueAction,
   isPullRequestAction,
+  resolveInstallationId,
   toCsv,
 } from '../src/dormancy-report'
 
@@ -98,5 +101,106 @@ describe('enterprise login activity', () => {
   it('detects user login audit action', () => {
     expect(isEnterpriseLoginAction('user.login')).toBe(true)
     expect(isEnterpriseLoginAction('business.sso_response')).toBe(false)
+  })
+})
+
+describe('detectTokenType', () => {
+  it('identifies ghu_ prefix as an app token (GitHub App user-to-server)', () => {
+    expect(detectTokenType('ghu_abc123XYZ')).toBe('app')
+  })
+
+  it('identifies ghs_ prefix as an app token (GitHub App server-to-server)', () => {
+    expect(detectTokenType('ghs_abc123XYZ')).toBe('app')
+  })
+
+  it('identifies ghp_ prefix as a PAT', () => {
+    expect(detectTokenType('ghp_abc123XYZ')).toBe('pat')
+  })
+
+  it('identifies fine-grained PAT prefix as a PAT', () => {
+    expect(detectTokenType('github_pat_abc123XYZ')).toBe('pat')
+  })
+
+  it('treats unknown prefixes as PAT', () => {
+    expect(detectTokenType('some_other_token')).toBe('pat')
+  })
+})
+
+describe('resolveInstallationId', () => {
+  function makeOctokit({
+    enterpriseResult,
+    orgResult,
+  }: {
+    enterpriseResult?: { id: number } | Error
+    orgResult?: { id: number } | Error
+  }) {
+    return {
+      rest: {
+        apps: {
+          getEnterpriseInstallation: enterpriseResult instanceof Error
+            ? vi.fn().mockRejectedValue(enterpriseResult)
+            : vi.fn().mockResolvedValue({ data: enterpriseResult }),
+          getOrgInstallation: orgResult instanceof Error
+            ? vi.fn().mockRejectedValue(orgResult)
+            : vi.fn().mockResolvedValue({ data: orgResult }),
+        },
+      },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any
+  }
+
+  it('returns enterprise installation ID when enterprise endpoint succeeds', async () => {
+    const octokit = makeOctokit({ enterpriseResult: { id: 42 } })
+    const id = await resolveInstallationId(octokit, undefined, 'my-enterprise')
+    expect(id).toBe(42)
+    expect(octokit.rest.apps.getEnterpriseInstallation).toHaveBeenCalledWith({ enterprise: 'my-enterprise' })
+  })
+
+  it('falls back to org when enterprise endpoint fails', async () => {
+    const octokit = makeOctokit({
+      enterpriseResult: new Error('not found'),
+      orgResult: { id: 99 },
+    })
+    const id = await resolveInstallationId(octokit, 'my-org', 'my-enterprise')
+    expect(id).toBe(99)
+    expect(octokit.rest.apps.getOrgInstallation).toHaveBeenCalledWith({ org: 'my-org' })
+  })
+
+  it('returns org installation ID when only org is provided', async () => {
+    const octokit = makeOctokit({ orgResult: { id: 7 } })
+    const id = await resolveInstallationId(octokit, 'my-org', undefined)
+    expect(id).toBe(7)
+    expect(octokit.rest.apps.getOrgInstallation).toHaveBeenCalledWith({ org: 'my-org' })
+  })
+
+  it('throws when neither org nor enterprise is provided', async () => {
+    const octokit = makeOctokit({})
+    await expect(resolveInstallationId(octokit, undefined, undefined)).rejects.toThrow(
+      'Cannot resolve GitHub App installation ID',
+    )
+  })
+})
+
+describe('decodePrivateKey', () => {
+  const PEM = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xHn/ygWep4\n-----END RSA PRIVATE KEY-----'
+
+  it('returns a plain PEM string unchanged', () => {
+    expect(decodePrivateKey(PEM)).toBe(PEM)
+  })
+
+  it('normalises escaped newlines in PEM strings from env vars', () => {
+    const escaped = PEM.replace(/\n/g, '\\n')
+    expect(decodePrivateKey(escaped)).toBe(PEM)
+  })
+
+  it('decodes a base64-encoded PEM string', () => {
+    const b64 = Buffer.from(PEM).toString('base64')
+    expect(decodePrivateKey(b64)).toBe(PEM)
+  })
+
+  it('throws on input that is neither PEM nor valid base64 PEM', () => {
+    expect(() => decodePrivateKey('not-a-key')).toThrow(
+      'does not appear to be a valid PEM string or base64-encoded PEM',
+    )
   })
 })
